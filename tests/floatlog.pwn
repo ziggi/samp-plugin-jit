@@ -1,3 +1,5 @@
+// OUTPUT: All tests passed
+
 #include "float_const"
 #include "test"
 

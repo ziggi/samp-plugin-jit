@@ -1,3 +1,5 @@
+// OUTPUT: All tests passed
+
 #include "test"
 
 func1()
@@ -23,15 +25,11 @@ public Test1();
 public Test2();
 public Test3();
 
-public OnGameModeInit()
+main()
 {
 	CallLocalFunction("Test1", "");
 	CallLocalFunction("Test2", "");
 	CallLocalFunction("Test3", "");
-}
-
-main()
-{
 	TestExit();
 }
 
@@ -168,5 +166,3 @@ public Test3()
 	#emit STOR.S.pri ret
 	TEST_TRUE(ret == 70);
 }
-
-

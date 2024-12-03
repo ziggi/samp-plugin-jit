@@ -1,4 +1,4 @@
-// Copyright (c) 2012-2018 Zeex
+// Copyright (c) 2012-2019 Zeex
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -49,6 +49,15 @@ class CompilerImpl {
   void SetErrorHandler(CompileErrorHandler *error_handler) {
     error_handler_ = error_handler;
   }
+  void SetSysreqDEnabled(bool flag) {
+    enable_sysreq_d_ = flag;
+  }
+  void SetSleepEnabled(bool flag) {
+    enable_sleep_ = flag;
+  }
+  void SetDebugFlags(unsigned int flags) {
+    debug_flags_ = flags;
+  }
 
   CodeBuffer *Compile(AMXRef amx);
 
@@ -76,11 +85,15 @@ class CompilerImpl {
   void EmitInstrTable();
   void EmitExec();
   void EmitExecHelper();
+  void EmitExecContHelper();
   void EmitHaltHelper();
   void EmitJumpLookup();
+  void EmitReverseJumpLookup();
   void EmitJumpHelper();
   void EmitSysreqCHelper();
   void EmitSysreqDHelper();
+  void EmitDebugPrint(const char *message);
+  void EmitDebugBreakpoint();
 
  private:
   const asmjit::Label &GetLabel(cell address);
@@ -94,13 +107,20 @@ class CompilerImpl {
   asmjit::Label amx_ptr_label_;
   asmjit::Label ebp_label_;
   asmjit::Label esp_label_;
+  asmjit::Label amx_ebp_label_;
+  asmjit::Label amx_esp_label_;
   asmjit::Label reset_ebp_label_;
   asmjit::Label reset_esp_label_;
+  asmjit::Label reset_stk_label_;
+  asmjit::Label reset_hea_label_;
   asmjit::Label exec_label_;
   asmjit::Label exec_helper_label_;
+  asmjit::Label exec_exit_label_;
+  asmjit::Label exec_cont_helper_label_;
   asmjit::Label halt_helper_label_;
   asmjit::Label jump_helper_label_;
   asmjit::Label jump_lookup_label_;
+  asmjit::Label reverse_jump_lookup_label_;
   asmjit::Label sysreq_c_helper_label_;
   asmjit::Label sysreq_d_helper_label_;
 
@@ -110,6 +130,9 @@ class CompilerImpl {
   asmjit::Logger *asmjit_logger_;
   Logger *logger_;
   CompileErrorHandler *error_handler_;
+  bool enable_sysreq_d_;
+  bool enable_sleep_;
+  unsigned int debug_flags_;
 };
 
 }  // namespace amxjit

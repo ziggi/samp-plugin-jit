@@ -1,4 +1,4 @@
-// Copyright (c) 2012-2018 Zeex
+// Copyright (c) 2012-2019 Zeex
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -36,6 +36,11 @@ class Logger;
 
 typedef int (AMXAPI *CodeEntryPoint)(cell index, cell *retval);
 
+enum DebugFlags {
+  DEBUG_LOGGING = 1,
+  DEBUG_BREAKPOINTS = 2
+};
+
 class CompileErrorHandler {
  public:
   virtual ~CompileErrorHandler() {}
@@ -64,6 +69,10 @@ class Compiler {
 
   void SetLogger(Logger *logger);
   void SetErrorHandler(CompileErrorHandler *error_handler);
+  void SetSysreqDEnabled(bool flag);
+  void SetSleepEnabled(bool flag);
+  void SetDebugFlags(unsigned int flags);
+
   CodeBuffer *Compile(AMXRef amx);
 
  private:

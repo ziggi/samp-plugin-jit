@@ -1,3 +1,5 @@
+// OUTPUT: All tests passed
+
 #include "test"
 
 // Fixes warning 205: redundant code: constant expression is zero

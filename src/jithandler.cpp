@@ -1,4 +1,4 @@
-// Copyright (c) 2012-2015 Zeex
+// Copyright (c) 2012-2019 Zeex
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -24,6 +24,7 @@
 
 #include <cassert>
 #include <cstdarg>
+#include <cstdlib>
 #include <string>
 #include <configreader.h>
 #include "jithandler.h"
@@ -33,11 +34,11 @@
 #include "amxjit/disasm.h"
 #include "amxjit/logger.h"
 
-#define logprintf Use_Printf_instead_of_logprintf
+#define logprintf Use_jit_printf_instead_of_logprintf
 
 namespace {
 
-void Printf(const char *format, ...) {
+void jit_printf(const char *format, ...) {
   std::va_list va;
   va_start(va, format);
 
@@ -52,9 +53,9 @@ void Printf(const char *format, ...) {
 class ErrorHandler: public amxjit::CompileErrorHandler {
  public:
   virtual void Execute(const amxjit::Instruction &instr) {
-    Printf("Invalid or unsupported instruction at address %08x:",
-           instr.address());
-    Printf("  => %s", instr.ToString().c_str());
+    jit_printf("Invalid or unsupported instruction at address %08x:",
+               instr.address());
+    jit_printf("  => %s", instr.ToString().c_str());
   }
 };
 
@@ -80,17 +81,26 @@ cell OnJITError(AMX *amx) {
 
 amxjit::CodeBuffer *Compile(AMX *amx) {
   if (!OnJITCompile(amx)) {
-    Printf("Compilation was disabled");
+    jit_printf("Compilation was disabled");
     return 0;
   }
 
   ConfigReader server_cfg("server.cfg");
+  bool enable_log = false;
+  server_cfg.GetValue("jit_log", enable_log);
+  bool enable_sysreq_d = true;
+  server_cfg.GetValue("jit_sysreq_d", enable_sysreq_d);
+  bool enable_sleep_support = false;
+  server_cfg.GetValue("jit_sleep", enable_sleep_support);
+  unsigned int debug_flags = 0;
+  server_cfg.GetValue("jit_debug", debug_flags);
 
-  bool jit_log = false;
-  server_cfg.GetValue("jit_log", jit_log);
+  if (std::getenv("JIT_SLEEP") != 0) {
+    enable_sleep_support = true;
+  }
 
   amxjit::Logger *logger = 0;
-  if (jit_log) {
+  if (enable_log) {
     logger = new amxjit::FileLogger("plugins/jit.log");
   }
 
@@ -98,11 +108,14 @@ amxjit::CodeBuffer *Compile(AMX *amx) {
   ErrorHandler error_handler;
   compiler.SetLogger(logger);
   compiler.SetErrorHandler(&error_handler);
+  compiler.SetSysreqDEnabled(enable_sysreq_d);
+  compiler.SetSleepEnabled(enable_sleep_support);
+  compiler.SetDebugFlags(debug_flags);
   amxjit::CodeBuffer *code = compiler.Compile(amx);
   delete logger;
 
   if (code == 0) {
-    Printf("Compilation failed");
+    jit_printf("Compilation failed");
     OnJITError(amx);
   }
   return code;
@@ -112,10 +125,9 @@ amxjit::CodeBuffer *Compile(AMX *amx) {
 
 JITHandler::JITHandler(AMX *amx):
   AMXHandler<JITHandler>(amx),
-  state_(INIT)
+  state_(INIT),
+  code_()
 {
-  amx->sysreq_d = 0;
-
   cell jit_var_addr;
   if (amx_FindPubVar(amx, "__JIT", &jit_var_addr) == AMX_ERR_NONE) {
     cell *jit_var;

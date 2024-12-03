@@ -1,4 +1,4 @@
-// Copyright (c) 2012-2018 Zeex
+// Copyright (c) 2012-2019 Zeex
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -32,6 +32,7 @@
 #include "cstdint.h"
 #include "disasm.h"
 #include "logger.h"
+#include "platform.h"
 
 using asmjit::Label;
 using asmjit::x86::byte_ptr;
@@ -62,8 +63,12 @@ struct RuntimeInfoBlock {
   intptr_t amx;
   intptr_t ebp;
   intptr_t esp;
+  intptr_t amx_ebp;
+  intptr_t amx_esp;
   intptr_t reset_ebp;
   intptr_t reset_esp;
+  cell reset_stk;
+  cell reset_hea;
   intptr_t instr_table;
   intptr_t instr_table_size;
 };
@@ -80,28 +85,64 @@ cell AMXJIT_CDECL GetNativeAddress(AMX *amx, int index) {
 
 class InstrTableEntry {
  public:
-  InstrTableEntry(): address(), start() {}
-  InstrTableEntry(cell address): address(address), start() {}
-  bool operator<(const InstrTableEntry &other) const {
-    return address < other.address;
+  InstrTableEntry(): address(), ptr() {}
+  InstrTableEntry(cell address, uintptr_t ptr): address(address), ptr(ptr) {}
+
+  static bool CompareByAMXAddress(
+    const InstrTableEntry &e1, const InstrTableEntry &e2)
+  {
+    return e1.address < e2.address;
   }
+
+  static bool CompareByJITPtr(
+    const InstrTableEntry &e1, const InstrTableEntry &e2)
+  {
+    return e1.ptr < e2.ptr;
+  }
+
  public:
   cell address;
-  void *start;
+  uintptr_t ptr;
 };
 
-void *AMXJIT_CDECL GetInstrStartPtr(cell address, RuntimeInfoBlock *rib) {
+uintptr_t AMXJIT_CDECL GetJITInstrPtr(cell address, RuntimeInfoBlock *rib) {
   assert(rib->instr_table != 0);
   assert(rib->instr_table_size > 0);
 
   InstrTableEntry *instr_table =
     reinterpret_cast<InstrTableEntry*>(rib->instr_table);
-  InstrTableEntry target(address);
+  InstrTableEntry target(address, 0);
 
-  std::pair<InstrTableEntry*, InstrTableEntry*> result =
-    std::equal_range(instr_table, instr_table + rib->instr_table_size, target);
-  if (result.first != result.second) {
-    return result.first->start;
+  InstrTableEntry *first = instr_table;
+  InstrTableEntry *last = instr_table + rib->instr_table_size;
+  InstrTableEntry *result = std::lower_bound(
+    first,
+    last,
+    target,
+    InstrTableEntry::CompareByAMXAddress);
+  if (result != last && result->address == address) {
+    return result->ptr;
+  }
+  return 0;
+}
+
+cell AMXJIT_CDECL GetANXAddressByJITInstrPtr(uintptr_t ptr, RuntimeInfoBlock *rib) {
+  assert(rib->instr_table != 0);
+  assert(rib->instr_table_size > 0);
+
+  InstrTableEntry *instr_table =
+    reinterpret_cast<InstrTableEntry*>(rib->instr_table);
+  InstrTableEntry target(0, ptr);
+
+  InstrTableEntry *first = instr_table;
+  InstrTableEntry *last = instr_table + rib->instr_table_size;
+  InstrTableEntry *result = std::lower_bound(
+    first,
+    last,
+    target,
+    InstrTableEntry::CompareByJITPtr);
+  if (result != last && result->ptr == ptr) {
+    return result->address;
   }
   return 0;
 }
@@ -153,15 +194,26 @@ CompilerImpl::CompilerImpl():
   amx_ptr_label_(asm_.newLabel()),
   ebp_label_(asm_.newLabel()),
   esp_label_(asm_.newLabel()),
+  amx_ebp_label_(asm_.newLabel()),
+  amx_esp_label_(asm_.newLabel()),
   reset_ebp_label_(asm_.newLabel()),
   reset_esp_label_(asm_.newLabel()),
+  reset_stk_label_(asm_.newLabel()),
+  reset_hea_label_(asm_.newLabel()),
   exec_label_(asm_.newLabel()),
   exec_helper_label_(asm_.newLabel()),
+  exec_exit_label_(asm_.newLabel()),
+  exec_cont_helper_label_(asm_.newLabel()),
   halt_helper_label_(asm_.newLabel()),
   jump_helper_label_(asm_.newLabel()),
   jump_lookup_label_(asm_.newLabel()),
+  reverse_jump_lookup_label_(asm_.newLabel()),
   sysreq_c_helper_label_(asm_.newLabel()),
-  sysreq_d_helper_label_(asm_.newLabel())
+  sysreq_d_helper_label_(asm_.newLabel()),
+  logger_(),
+  error_handler_(),
+  enable_sysreq_d_(false),
+  debug_flags_(0)
 {
 }
 
@@ -172,8 +224,12 @@ CodeBuffer *CompilerImpl::Compile(AMXRef amx) {
   EmitInstrTable();
   EmitExec();
   EmitExecHelper();
+  if (enable_sleep_) {
+    EmitExecContHelper();
+  }
   EmitHaltHelper();
   EmitJumpLookup();
+  EmitReverseJumpLookup();
   EmitJumpHelper();
   EmitSysreqCHelper();
   EmitSysreqDHelper();
@@ -209,6 +265,12 @@ CodeBuffer *CompilerImpl::Compile(AMXRef amx) {
                                 instr.address(),
                                 instr.ToString().c_str());
     }
+
+    // eax = PRI
+    // ecx = ALT
+    // ebp = FRM
+    // esp = STK
+    // ebx = data (amx->data or amx->base + amxhdr->dat)
 
     switch (instr.opcode().GetId()) {
       case OP_LOAD_PRI:
@@ -531,8 +593,13 @@ CodeBuffer *CompilerImpl::Compile(AMXRef amx) {
         asm_.add(ebp, ebx);
         asm_.pop(edx);
         asm_.add(esp, dword_ptr(esp));
+        asm_.add(esp, 4);
+        asm_.mov(esi, dword_ptr(amx_ptr_label_));
+        asm_.mov(edi, esp);
+        asm_.sub(edi, ebx);
+        asm_.mov(dword_ptr(esi, offsetof(AMX, stk)), edi);
         asm_.push(edx);
-        asm_.ret(4);
+        asm_.ret();
         break;
       case OP_JUMP_PRI:
         // CIP = PRI (indirect jump)
@@ -958,7 +1025,7 @@ CodeBuffer *CompilerImpl::Compile(AMXRef amx) {
         // Abort execution (exit value in PRI), parameters other than 0
         // have a special meaning.
         asm_.mov(edi, instr.operand());
-        asm_.jmp(halt_helper_label_);
+        asm_.call(halt_helper_label_);
         break;
       case OP_BOUNDS: {
         // Abort execution if PRI > value or if PRI < 0.
@@ -970,13 +1037,15 @@ CodeBuffer *CompilerImpl::Compile(AMXRef amx) {
           asm_.jl(halt_label);
           asm_.jmp(exit_label);
         asm_.bind(halt_label);
+          EmitDebugBreakpoint();
           asm_.mov(edi, AMX_ERR_BOUNDS);
-          asm_.jmp(halt_helper_label_);
+          asm_.call(halt_helper_label_);
         asm_.bind(exit_label);
         break;
       }
       case OP_SYSREQ_PRI:
         // Call system service, service number in PRI.
+        asm_.push(eax);
         asm_.call(sysreq_c_helper_label_);
         break;
       case OP_SYSREQ_C: {
@@ -985,8 +1054,21 @@ CodeBuffer *CompilerImpl::Compile(AMXRef amx) {
         if (name == 0) {
           error = true;
         } else {
-          if (!EmitIntrinsic(name)) {
-            asm_.mov(eax, instr.operand());
+          bool handled = EmitIntrinsic(name);
+          if (!handled && amx->sysreq_d && enable_sysreq_d_) {
+            // Optimization: if we already know the address we can call this
+            // native function directly.
+            cell address = amx.GetNativeAddress(instr.operand());
+            if (address != 0) {
+              // Sometimes the address can be 0: for example, when a function
+              // is registered _after_ JIT compilation (could be a plugin).
+              asm_.push(address);
+              asm_.call(sysreq_d_helper_label_);
+              handled = true;
+            }
+          }
+          if (!handled) {
+            asm_.push(instr.operand());
             asm_.call(sysreq_c_helper_label_);
           }
         }
@@ -999,7 +1081,7 @@ CodeBuffer *CompilerImpl::Compile(AMXRef amx) {
           error = true;
         } else {
           if (!EmitIntrinsic(name)) {
-            asm_.mov(eax, instr.operand());
+            asm_.push(instr.operand());
             asm_.call(sysreq_d_helper_label_);
           }
         }
@@ -1059,6 +1141,7 @@ CodeBuffer *CompilerImpl::Compile(AMXRef amx) {
         break;
       case OP_BREAK:
         // Conditional breakpoint.
+        EmitDebugBreakpoint();
         break;
     default:
       error = true;
@@ -1085,15 +1168,16 @@ CodeBuffer *CompilerImpl::Compile(AMXRef amx) {
     for (std::map<cell, std::ptrdiff_t>::const_iterator it = instr_map_.begin();
          it != instr_map_.end(); it++) {
       ite->address = it->first;
-      ite->start = static_cast<unsigned char*>(code_blob) + it->second;
+      ite->ptr = reinterpret_cast<uintptr_t>(code_blob) + it->second;
       ite++;
     }
   }
 
   amx_.Reset();
-  if (asm_.getLogger() != 0) {
-    delete logger_;
+
+  if (asmjit_logger_ != 0) {
     asm_.setLogger(0);
+    delete asmjit_logger_;
   }
 
   return code_buffer;
@@ -1281,7 +1365,7 @@ bool CompilerImpl::EmitIntrinsic(const char *name) {
   };
 
   static const Intrinsic intrinsics[] = {
-    // Floating-point operations.
+    // float.inc
     {"float",       &CompilerImpl::float_},
     {"floatabs",    &CompilerImpl::floatabs},
     {"floatadd",    &CompilerImpl::floatadd},
@@ -1290,7 +1374,7 @@ bool CompilerImpl::EmitIntrinsic(const char *name) {
     {"floatdiv",    &CompilerImpl::floatdiv},
     {"floatsqroot", &CompilerImpl::floatsqroot},
     {"floatcmp",    &CompilerImpl::floatcmp},
-    // Core operations.
+    // core.inc
     {"clamp",       &CompilerImpl::clamp},
     {"heapspace",   &CompilerImpl::heapspace},
     {"numargs",     &CompilerImpl::numargs},
@@ -1319,10 +1403,18 @@ void CompilerImpl::EmitRuntimeInfo() {
     asm_.dd(0); // rib->ebp
   asm_.bind(esp_label_);
     asm_.dd(0); // rib->esp
+  asm_.bind(amx_ebp_label_);
+    asm_.dd(0); // rib->amx_ebp
+  asm_.bind(amx_esp_label_);
+    asm_.dd(0); // rib->amx_esp
   asm_.bind(reset_ebp_label_);
     asm_.dd(0); // rib->reset_ebp
   asm_.bind(reset_esp_label_);
     asm_.dd(0); // rib->reset_esp
+  asm_.bind(reset_stk_label_);
+    asm_.dd(0); // rib->reset_stk
+  asm_.bind(reset_hea_label_);
+    asm_.dd(0); // rib->reset_hea
     asm_.dd(0); // rib->instr_map
     asm_.dd(0); // rib->instr_map_size
 }
@@ -1357,21 +1449,25 @@ void CompilerImpl::EmitExec() {
   Label stack_underflow_label = asm_.newLabel();
   Label native_not_found_label = asm_.newLabel();
   Label public_not_found_label = asm_.newLabel();
+  Label after_call_label_ = asm_.newLabel();
   Label finish_label = asm_.newLabel();
   Label return_label = asm_.newLabel();
+  Label continue_from_sleep_label = asm_.newLabel();
 
   int arg_index = 8;
   int arg_retval = 12;
   int var_address = -4;
   int var_reset_ebp = -8;
   int var_reset_esp = -12;
+  int var_reset_stk = -16;
+  int var_reset_hea = -20;
 
   asm_.bind(exec_label_);
     asm_.push(ebp);
     asm_.mov(ebp, esp);
 
     // Allocate space for the local variables.
-    asm_.sub(esp, 12);
+    asm_.sub(esp, 20);
 
     asm_.push(esi);
     asm_.mov(esi, dword_ptr(amx_ptr_label_));
@@ -1386,7 +1482,6 @@ void CompilerImpl::EmitExec() {
     asm_.add(ebx, eax);
 
   asm_.bind(null_data_label);
-
     // Check for a stack/heap collision (stack/heap overflow).
     asm_.mov(ecx, dword_ptr(esi, offsetof(AMX, hea)));
     asm_.mov(edx, dword_ptr(esi, offsetof(AMX, stk)));
@@ -1413,6 +1508,14 @@ void CompilerImpl::EmitExec() {
     // Reset the error code.
     asm_.mov(dword_ptr(esi, offsetof(AMX, error)), AMX_ERR_NONE);
 
+    if (enable_sleep_) {
+      // Handle AMX_EXEC_CONT case.
+      asm_.mov(ecx, dword_ptr(ebp, arg_index));
+      asm_.mov(edx, AMX_EXEC_CONT);
+      asm_.cmp(ecx, edx);
+      asm_.je(continue_from_sleep_label);
+    }
+
     // Get the address of the public function.
     asm_.push(dword_ptr(ebp, arg_index));
     asm_.mov(eax, dword_ptr(amx_ptr_label_));
@@ -1428,18 +1531,9 @@ void CompilerImpl::EmitExec() {
     asm_.lea(ecx, dword_ptr(rib_start_label_));
     asm_.push(ecx);
     asm_.push(eax);
-    asm_.call(reinterpret_cast<asmjit::Ptr>(&GetInstrStartPtr));
+    asm_.call(reinterpret_cast<asmjit::Ptr>(&GetJITInstrPtr));
     asm_.add(esp, 8);
     asm_.mov(dword_ptr(ebp, var_address), eax);
-
-    // Push the size of the arguments and reset the parameter count.
-    asm_.mov(eax, dword_ptr(esi, offsetof(AMX, paramcount)));
-    asm_.imul(eax, eax, sizeof(cell));
-    asm_.mov(ecx, dword_ptr(esi, offsetof(AMX, stk)));
-    asm_.sub(ecx, sizeof(cell));
-    asm_.mov(dword_ptr(ebx, ecx), eax);
-    asm_.mov(dword_ptr(esi, offsetof(AMX, stk)), ecx);
-    asm_.mov(dword_ptr(esi, offsetof(AMX, paramcount)), 0);
 
     // Save the old reset_ebp and reset_esp on the stack.
     asm_.mov(eax, dword_ptr(reset_ebp_label_));
@@ -1447,11 +1541,18 @@ void CompilerImpl::EmitExec() {
     asm_.mov(eax, dword_ptr(reset_esp_label_));
     asm_.mov(dword_ptr(ebp, var_reset_esp), eax);
 
+    // Now do the same for reset_stk and reset_hea.
+    asm_.mov(eax, dword_ptr(reset_stk_label_));
+    asm_.mov(dword_ptr(ebp, var_reset_stk), eax);
+    asm_.mov(eax, dword_ptr(reset_hea_label_));
+    asm_.mov(dword_ptr(ebp, var_reset_hea), eax);
+
     // Call the function.
     asm_.push(dword_ptr(ebp, var_address));
     asm_.call(exec_helper_label_);
     asm_.add(esp, 4);
 
+  asm_.bind(after_call_label_);
     // Copy the return value to retval (if it's not null).
     asm_.mov(ecx, dword_ptr(ebp, arg_retval));
     asm_.test(ecx, ecx);
@@ -1464,6 +1565,12 @@ void CompilerImpl::EmitExec() {
     asm_.mov(dword_ptr(reset_ebp_label_), eax);
     asm_.mov(eax, dword_ptr(ebp, var_reset_esp));
     asm_.mov(dword_ptr(reset_esp_label_), eax);
+
+    // Again, do the same for reset_stk and reset_hea.
+    asm_.mov(eax, dword_ptr(ebp, var_reset_stk));
+    asm_.mov(dword_ptr(reset_stk_label_), eax);
+    asm_.mov(eax, dword_ptr(ebp, var_reset_hea));
+    asm_.mov(dword_ptr(reset_hea_label_), eax);
 
     // Copy amx->error for return and reset it.
     asm_.mov(eax, AMX_ERR_NONE);
@@ -1495,82 +1602,235 @@ void CompilerImpl::EmitExec() {
   asm_.bind(public_not_found_label);
     asm_.mov(eax, AMX_ERR_INDEX);
     asm_.jmp(return_label);
+
+    if (enable_sleep_) {
+    asm_.bind(continue_from_sleep_label);
+      asm_.call(exec_cont_helper_label_);
+      asm_.jmp(after_call_label_);
+    }
 }
 
 // cell AMXJIT_CDECL ExecHelper(void *address);
 void CompilerImpl::EmitExecHelper() {
+  Label call_return_label = asm_.newLabel();
+
   asm_.bind(exec_helper_label_);
-    // Store the function address in eax.
+    EmitDebugPrint("ExecHelper()");
+
+    // Store the address in eax.
     asm_.mov(eax, dword_ptr(esp, 4));
 
-    // These registers are caller-saved in JIT code.
+    // We must preserve these registers because they are callee-saved in x86
+    // code (cdecl).
+    //
+    // https://en.wikipedia.org/wiki/X86_calling_conventions#Caller_clean-up
     asm_.push(esi);
     asm_.push(edi);
 
-    // Store the old ebp and esp on the stack.
+    // Save current stack pointers on the stack.
     asm_.push(dword_ptr(ebp_label_));
     asm_.push(dword_ptr(esp_label_));
+    asm_.push(dword_ptr(amx_ebp_label_));
+    asm_.push(dword_ptr(amx_esp_label_));
 
-    // The most recent ebp and esp are stored in RIB.
-    asm_.mov(dword_ptr(ebp_label_), ebp);
-    asm_.mov(dword_ptr(esp_label_), esp);
-
-    // Switch from the native stack to the AMX stack.
+    // Push parameters size to the AMX stack and reset the parameter count.
+    //
+    // cell new_stk = amx->stk - sizeof(cell);
+    // *(data + new_stk) = amx->paramcount * sizeof(cell);
+    // amx->paramcount = 0;
+    // reset_stk += amx->paramcount * sizeof(cell);
+    // reset_hea = amx->hea;
+    //
     asm_.mov(ecx, dword_ptr(amx_ptr_label_));
-    asm_.mov(edx, dword_ptr(esi, offsetof(AMX, frm)));
-    asm_.lea(ebp, dword_ptr(ebx, edx)); // ebp = data + amx->frm
+    asm_.mov(edx, dword_ptr(ecx, offsetof(AMX, hea)));
+    asm_.mov(dword_ptr(reset_hea_label_), edx);
+    asm_.mov(esi, dword_ptr(ecx, offsetof(AMX, paramcount)));
+    asm_.imul(esi, esi, sizeof(cell));
     asm_.mov(edx, dword_ptr(ecx, offsetof(AMX, stk)));
-    asm_.lea(esp, dword_ptr(ebx, edx)); // esp = data + amx->stk
+    asm_.lea(edi, dword_ptr(edx, esi));
+    asm_.mov(dword_ptr(reset_stk_label_), edi);
+    asm_.sub(edx, sizeof(cell));
+    asm_.mov(dword_ptr(ebx, edx), esi);
+    asm_.mov(dword_ptr(ecx, offsetof(AMX, paramcount)), 0);
 
-    // In order to make halt() work we must able to return to this place.
-    asm_.lea(ecx, dword_ptr(esp, - 4));
+    // Switch to the AMX stack.
+    asm_.mov(dword_ptr(esp_label_), esp);
+    asm_.add(edx, ebx);
+    asm_.mov(dword_ptr(amx_esp_label_), edx);
+    asm_.mov(esp, edx); // esp = data + new_stk
+    asm_.mov(dword_ptr(ebp_label_), ebp);
+    asm_.mov(edx, dword_ptr(ecx, offsetof(AMX, frm)));
+    asm_.add(edx, ebx);
+    asm_.mov(dword_ptr(amx_ebp_label_), edx);
+    asm_.mov(ebp, edx); // ebp = data + amx->frm
+
+    // To make "halt" work we must be able to return here later.
+    // Subtract 4 bytes to keep the return address on the stack after return.
+    asm_.lea(ecx, dword_ptr(esp, -4));
     asm_.mov(dword_ptr(reset_esp_label_), ecx);
     asm_.mov(dword_ptr(reset_ebp_label_), ebp);
 
-    // Call the function. Prior to this point ebx should point to the
-    // AMX data and the both stack pointers should point to somewhere
-    // in the AMX stack.
+    // Call the function. Prior to this point ebx should point to the data
+    // section and both stack pointers should point somewhere on the AMX stack.
+    // asm_.lea(ecx, dword_ptr(halt_helper_label_));
+    // asm_.push(ecx);
     asm_.call(eax);
 
-    // Keep the AMX stack registers up-to-date. This wouldn't be necessary
-    // if RETN didn't modify them (it pops all arguments off the stack).
-    asm_.mov(ecx, dword_ptr(amx_ptr_label_));
+  asm_.bind(call_return_label);
+    asm_.mov(esi, dword_ptr(amx_ptr_label_));
+    asm_.mov(edi, dword_ptr(esi, offsetof(AMX, error)));
+
+    if (enable_sleep_) {
+      asm_.cmp(edi, AMX_ERR_SLEEP);
+      asm_.jnz(exec_exit_label_);
+    }
+
+    // Sync AMX registers on successful exit. If there was an error, they have
+    // been already synced by HaltHelper.
+    asm_.mov(dword_ptr(esi, offsetof(AMX, pri)), eax);
+    asm_.mov(dword_ptr(esi, offsetof(AMX, alt)), ecx);
     asm_.mov(edx, ebp);
     asm_.sub(edx, ebx);
-    asm_.mov(dword_ptr(ecx, offsetof(AMX, frm)), edx); // amx->frm = ebp - data
+    asm_.mov(dword_ptr(esi, offsetof(AMX, frm)), edx);
     asm_.mov(edx, esp);
     asm_.sub(edx, ebx);
-    asm_.mov(dword_ptr(ecx, offsetof(AMX, stk)), edx); // amx->stk = esp - data
+    asm_.mov(dword_ptr(esi, offsetof(AMX, stk)), edx);
+    // HEA is already in sync.
 
+  asm_.bind(exec_exit_label_);
     // Switch back to the native stack.
+    asm_.mov(dword_ptr(amx_ebp_label_), ebp);
     asm_.mov(ebp, dword_ptr(ebp_label_));
+    asm_.mov(dword_ptr(amx_esp_label_), esp);
     asm_.mov(esp, dword_ptr(esp_label_));
 
+    asm_.pop(dword_ptr(amx_esp_label_));
+    asm_.pop(dword_ptr(amx_ebp_label_));
     asm_.pop(dword_ptr(esp_label_));
     asm_.pop(dword_ptr(ebp_label_));
+
+    EmitDebugPrint("ExecHelper: returned from entry point");
 
     asm_.pop(edi);
     asm_.pop(esi);
     asm_.ret();
 }
 
+// cell AMXJIT_CDECL ExecContHelper();
+void CompilerImpl::EmitExecContHelper() {
+  // Execute code after returning from sleep (index = AMX_EXEC_CONT).
+  //
+  // frm = amx->frm;
+  // stk = amx->stk;
+  // hea = amx->hea;
+  // pri = amx->pri;
+  // alt = amx->alt;
+  // reset_stk = amx->reset_stk;
+  // reset_hea = amx->reset_hea;
+  // cip = (cell *)(code + (int)amx->cip);
+
+  asm_.bind(exec_cont_helper_label_);
+    EmitDebugPrint("ExecContHelper()");
+
+    // Store the address in eax.
+    asm_.mov(eax, dword_ptr(esp, 4));
+
+    asm_.push(esi);
+    asm_.push(edi);
+
+    // Save current stack pointers on the stack.
+    asm_.push(dword_ptr(ebp_label_));
+    asm_.push(dword_ptr(esp_label_));
+    asm_.push(dword_ptr(amx_ebp_label_));
+    asm_.push(dword_ptr(amx_esp_label_));
+
+    // Switch to the AMX stack.
+    asm_.mov(ecx, dword_ptr(amx_ptr_label_));
+    asm_.mov(dword_ptr(ebp_label_), ebp);
+    asm_.mov(edx, dword_ptr(ecx, offsetof(AMX, frm)));
+    asm_.add(edx, ebx);
+    asm_.mov(dword_ptr(amx_ebp_label_), edx);
+    asm_.mov(ebp, edx); // ebp = data + amx->frm
+    asm_.mov(dword_ptr(esp_label_), esp);
+    asm_.mov(edx, dword_ptr(ecx, offsetof(AMX, stk)));
+    asm_.add(edx, ebx);
+    asm_.mov(dword_ptr(amx_esp_label_), edx);
+    asm_.mov(esp, edx); // esp = data + amx->stk
+
+    // To make "halt" work we must be able to return here later.
+    // Subtract 4 bytes to keep the return address on the stack after return.
+    asm_.lea(ecx, dword_ptr(esp, -4));
+    asm_.mov(dword_ptr(reset_esp_label_), ecx);
+    asm_.mov(dword_ptr(reset_ebp_label_), ebp);
+
+    // Restore registers and jump to the address saved before entering sleep
+    // mode (amx->cip). Stack registers - STK and FRM - have already been
+    // restored by the preceding stack switching code above at this point, so
+    // we don't touch them here.
+    asm_.mov(eax, dword_ptr(esi, offsetof(AMX, reset_stk)));
+    asm_.mov(dword_ptr(reset_stk_label_), eax);
+    asm_.mov(eax, dword_ptr(esi, offsetof(AMX, reset_hea)));
+    asm_.mov(dword_ptr(reset_hea_label_), eax);
+    asm_.mov(eax, dword_ptr(esi, offsetof(AMX, cip)));
+    asm_.call(jump_lookup_label_);
+    asm_.mov(edx, eax); // address
+    asm_.mov(eax, dword_ptr(esi, offsetof(AMX, pri)));
+    asm_.mov(ecx, dword_ptr(esi, offsetof(AMX, alt)));
+    asm_.jmp(edx);
+}
+
 // void HaltHelper(int error [edi]);
 void CompilerImpl::EmitHaltHelper() {
-  asm_.bind(halt_helper_label_);
-    asm_.mov(esi, dword_ptr(amx_ptr_label_));
-    asm_.mov(dword_ptr(esi, offsetof(AMX, error)), edi); // error code in edi
+  Label sleep_label = asm_.newLabel();
+  Label exit_label = asm_.newLabel();
 
-    // Reset the stack so that we return to the instruction next to CALL.
+  asm_.bind(halt_helper_label_);
+    EmitDebugPrint("HaltHelper()");
+
+    // amx->error = error (edi);
+    // amx->pri = pri;
+    // amx->alt = alt;
+    // amx->frm = frm;
+    // amx->stk = stk;
+    asm_.mov(esi, dword_ptr(amx_ptr_label_));
+    asm_.mov(dword_ptr(esi, offsetof(AMX, error)), edi);
+    asm_.mov(dword_ptr(esi, offsetof(AMX, pri)), eax);
+    asm_.mov(dword_ptr(esi, offsetof(AMX, alt)), ecx);
+    asm_.pop(ecx); // return address
+    asm_.mov(edx, ebp);
+    asm_.sub(edx, ebx);
+    asm_.mov(dword_ptr(esi, offsetof(AMX, frm)), edx);
+    asm_.mov(edx, esp);
+    asm_.sub(edx, ebx);
+    asm_.mov(dword_ptr(esi, offsetof(AMX, stk)), edx);
+    // HEA is already in sync.
+
+    if (enable_sleep_) {
+      // Handle error == AMX_ERR_SLEEP case.
+      asm_.cmp(edi, AMX_ERR_SLEEP);
+      asm_.je(sleep_label);
+    }
+
+  asm_.bind(exit_label);
+    // Reset the stack and return back to ExecHelper().
     asm_.mov(esp, dword_ptr(reset_esp_label_));
     asm_.mov(ebp, dword_ptr(reset_ebp_label_));
+    asm_.jmp(exec_exit_label_);
 
-    // Pop the public function's arguments as it done by RETN.
-    asm_.pop(eax);
-    asm_.add(esp, dword_ptr(esp));
-    asm_.add(esp, 4);
-    asm_.push(eax);
-
-    asm_.ret();
+    if (enable_sleep_) {
+    asm_.bind(sleep_label);
+      // amx->cip = ReverseJumpLookup(return_address);
+      // amx->reset_stk = reset_stk;
+      // amx->reset_hea = reset_hea;
+      asm_.mov(eax, ecx);
+      asm_.call(reverse_jump_lookup_label_);
+      asm_.mov(dword_ptr(esi, offsetof(AMX, cip)), eax);
+      asm_.mov(edx, dword_ptr(reset_stk_label_));
+      asm_.mov(dword_ptr(esi, offsetof(AMX, reset_stk)), edx);
+      asm_.mov(edx, dword_ptr(reset_hea_label_));
+      asm_.mov(dword_ptr(esi, offsetof(AMX, reset_hea)), edx);
+      asm_.jmp(exit_label);
+    }
 }
 
 // void JumpHelper(void *address [eax]);
@@ -1598,100 +1858,247 @@ void CompilerImpl::EmitJumpHelper() {
 void CompilerImpl::EmitJumpLookup() {
   asm_.bind(jump_lookup_label_);
     asm_.push(ecx);
+    asm_.push(edx);
 
     asm_.lea(ecx, dword_ptr(rib_start_label_));
     asm_.push(ecx);
     asm_.push(eax);
-    asm_.call(reinterpret_cast<asmjit::Ptr>(&GetInstrStartPtr));
+    asm_.call(reinterpret_cast<asmjit::Ptr>(&GetJITInstrPtr));
     asm_.add(esp, 8);
 
+    asm_.pop(edx);
     asm_.pop(ecx);
     asm_.ret();
 }
 
-// cell SysreqCHelper(int index [eax]);
-void CompilerImpl::EmitSysreqCHelper() {
-  asm_.bind(sysreq_c_helper_label_);
+// void ReverseJumpLookup(void *address [eax]);
+void CompilerImpl::EmitReverseJumpLookup() {
+  asm_.bind(reverse_jump_lookup_label_);
     asm_.push(ecx);
-    asm_.lea(ecx, dword_ptr(esp, 8));
+    asm_.push(edx);
+
+    asm_.lea(ecx, dword_ptr(rib_start_label_));
+    asm_.push(ecx);
+    asm_.push(eax);
+    asm_.call(reinterpret_cast<asmjit::Ptr>(&GetANXAddressByJITInstrPtr));
+    asm_.add(esp, 8);
+
+    asm_.pop(edx);
+    asm_.pop(ecx);
+    asm_.ret();
+}
+
+// cell AMXJIT_STDCALL SysreqCHelper(int index);
+void CompilerImpl::EmitSysreqCHelper() {
+  Label error_label = asm_.newLabel();
+  Label sleep_error_label = asm_.newLabel();
+
+  // Can modify registers: eax, edx, esi, edi
+  // eax = return value (PRI)
+
+  asm_.bind(sysreq_c_helper_label_);
+    EmitDebugPrint("sysreq.c");
+
+    asm_.mov(edx, dword_ptr(amx_ptr_label_));
+
+    if (enable_sleep_) {
+      // Copy CIP to amx->cip (needed for "sleep" to work).
+      asm_.mov(eax, dword_ptr(esp));  // return address
+      asm_.call(reverse_jump_lookup_label_);
+      asm_.mov(dword_ptr(edx, offsetof(AMX, cip)), eax);
+    }
+
+    asm_.pop(esi); // return address
+    asm_.pop(eax); // index
+    asm_.lea(edi, dword_ptr(esp)); // params
 
     // Switch to the native stack.
-    asm_.mov(edx, dword_ptr(amx_ptr_label_));
+    asm_.mov(dword_ptr(amx_ebp_label_), ebp);
     asm_.sub(ebp, ebx);
     asm_.mov(dword_ptr(edx, offsetof(AMX, frm)), ebp); // amx->frm = ebp - data
     asm_.mov(ebp, dword_ptr(ebp_label_));
+    asm_.mov(dword_ptr(amx_esp_label_), esp);
     asm_.sub(esp, ebx);
     asm_.mov(dword_ptr(edx, offsetof(AMX, stk)), esp); // amx->stk = esp - data
     asm_.mov(esp, dword_ptr(esp_label_));
+    asm_.push(dword_ptr(amx_esp_label_));
+    asm_.push(dword_ptr(amx_ebp_label_));
 
-    // Allocate stack space for result. Before this esp was pointing directly
-    // to params, after this params will be esp+4.
+    // Push ALT to the stack (not enough registers to keep it around).
+    asm_.push(ecx);
+
+    // Allocate space for the result parameter of amx_Callback().
     asm_.push(0);
-    asm_.mov(edi, esp);
+    asm_.mov(ecx, esp);
 
     // Call the native function via amx->callback.
-    asm_.push(ecx); // params
-    asm_.push(edi); // result
+    asm_.push(edi); // params
+    asm_.push(ecx); // result
     asm_.push(eax); // index
     asm_.push(edx); // amx
     asm_.call(dword_ptr(edx, offsetof(AMX, callback)));
+    asm_.mov(edi, eax);
+    asm_.mov(eax, dword_ptr(ecx)); // eax = *result
     asm_.add(esp, 20);
 
-    // Get the result.
-    asm_.mov(edi, dword_ptr(esp, -4));
-    asm_.xchg(eax, edi);
+    asm_.pop(ecx); // ALT
 
     // Switch back to the AMX stack.
-    asm_.mov(edx, dword_ptr(amx_ptr_label_));
-    asm_.mov(dword_ptr(ebp_label_), ebp);
-    asm_.mov(ecx, dword_ptr(edx, offsetof(AMX, frm)));
-    asm_.lea(ebp, dword_ptr(ebx, ecx)); // ebp = data + amx->frm
-    asm_.mov(dword_ptr(esp_label_), esp);
-    asm_.mov(ecx, dword_ptr(edx, offsetof(AMX, stk)));
-    asm_.lea(esp, dword_ptr(ebx, ecx)); // ebp = data + amx->stk
+    asm_.pop(edx);
+    asm_.mov(ebp, edx);
+    asm_.pop(edx);
+    asm_.mov(esp, edx);
 
-    // Check for errors.
+    // Check return value for errors and leave.
+    if (enable_sleep_) {
+      asm_.cmp(edi, AMX_ERR_SLEEP);
+      asm_.je(sleep_error_label);
+    }
     asm_.cmp(edi, AMX_ERR_NONE);
-    asm_.jne(halt_helper_label_);
-
-    // Modify the return address so that we return next to the sysreq point.
-    asm_.pop(ecx);
+    asm_.jne(error_label);
+    asm_.push(esi); // return address
     asm_.ret();
+
+  asm_.bind(error_label);
+    asm_.call(halt_helper_label_);
+
+    if (enable_sleep_) {
+    asm_.bind(sleep_error_label);
+      // Enter sleep mode (return value = AMX_ERR_SLEEP).
+      //
+      // amx->cip = (cell)((unsigned char *)cip-code);
+      // amx->hea = hea;
+      // amx->frm = frm;
+      // amx->stk = stk;
+      // amx->pri = pri;
+      // amx->alt = alt;
+      // amx->reset_stk = reset_stk;
+      // amx->reset_hea = reset_hea;
+      EmitDebugPrint("AMX_ERR_SLEEP");
+
+      asm_.mov(edx, dword_ptr(amx_ptr_label_));
+      asm_.mov(dword_ptr(edx, offsetof(AMX, pri)), eax);
+      asm_.mov(dword_ptr(edx, offsetof(AMX, alt)), ecx);
+      asm_.mov(ecx, dword_ptr(reset_stk_label_));
+      asm_.mov(dword_ptr(edx, offsetof(AMX, reset_stk)), ecx);
+      asm_.mov(ecx, dword_ptr(reset_hea_label_));
+      asm_.mov(dword_ptr(edx, offsetof(AMX, reset_hea)), ecx);
+
+      asm_.jmp(exec_exit_label_);
+    }
 }
 
-// cell SysreqDHelper(void *address [eax]);
+// cell AMXJIT_STDCALL SysreqDHelper(void *address);
 void CompilerImpl::EmitSysreqDHelper() {
+  Label error_label = asm_.newLabel();
+  Label sleep_error_label = asm_.newLabel();
+
   asm_.bind(sysreq_d_helper_label_);
-    asm_.push(ecx);
-    asm_.lea(ecx, dword_ptr(esp, 8));
+    EmitDebugPrint("sysreq.d");
+
+    asm_.mov(edx, dword_ptr(amx_ptr_label_));
+
+    if (enable_sleep_) {
+      // Save CIP to amx->cip (needed for sleep to work).
+      asm_.mov(eax, dword_ptr(esp));  // return address
+      asm_.call(reverse_jump_lookup_label_);
+      asm_.mov(dword_ptr(edx, offsetof(AMX, cip)), eax);
+    }
+
+    asm_.pop(esi); // return address
+    asm_.pop(eax); // address
+    asm_.lea(edi, dword_ptr(esp)); // params
 
     // Switch to the native stack.
-    asm_.mov(edx, dword_ptr(amx_ptr_label_));
+    asm_.mov(dword_ptr(amx_ebp_label_), ebp);
     asm_.sub(ebp, ebx);
     asm_.mov(dword_ptr(edx, offsetof(AMX, frm)), ebp); // amx->frm = ebp - data
     asm_.mov(ebp, dword_ptr(ebp_label_));
+    asm_.mov(dword_ptr(amx_esp_label_), esp);
     asm_.sub(esp, ebx);
     asm_.mov(dword_ptr(edx, offsetof(AMX, stk)), esp); // amx->stk = esp - data
     asm_.mov(esp, dword_ptr(esp_label_));
+    asm_.push(dword_ptr(amx_esp_label_));
+    asm_.push(dword_ptr(amx_ebp_label_));
+
+    // Push ALT to the stack (not enough registers to keep it around).
+    asm_.push(ecx); // ALT
 
     // Call the native function.
-    asm_.push(ecx); // params
+    asm_.push(edi); // params
     asm_.push(edx); // amx
     asm_.call(eax); // address
     asm_.add(esp, 8);
+    // At this point the return value is stored in eax.
+
+    asm_.pop(ecx); // ALT
 
     // Switch back to the AMX stack.
-    asm_.mov(edx, dword_ptr(amx_ptr_label_));
-    asm_.mov(dword_ptr(ebp_label_), ebp);
-    asm_.mov(ecx, dword_ptr(edx, offsetof(AMX, frm)));
-    asm_.lea(ebp, dword_ptr(ebx, ecx)); // ebp = data + amx->frm
-    asm_.mov(dword_ptr(esp_label_), esp);
-    asm_.mov(ecx, dword_ptr(edx, offsetof(AMX, stk)));
-    asm_.lea(esp, dword_ptr(ebx, ecx)); // ebp = data + amx->stk
+    asm_.pop(edx);
+    asm_.mov(ebp, edx);
+    asm_.pop(edx);
+    asm_.mov(esp, edx);
 
-    // Modify the return address so that we return next to the sysreq point.
-    asm_.pop(ecx);
+    asm_.mov(edx, dword_ptr(amx_ptr_label_));
+    asm_.mov(edi, dword_ptr(edx, offsetof(AMX, error)));
+
+    // Check for errors and leave.
+    if (enable_sleep_) {
+      asm_.cmp(edi, AMX_ERR_SLEEP);
+      asm_.je(sleep_error_label);
+    }
+    asm_.cmp(edi, AMX_ERR_NONE);
+    asm_.jne(error_label);
+    asm_.push(esi); // return address
     asm_.ret();
+
+  asm_.bind(error_label);
+    asm_.call(halt_helper_label_);
+
+    if (enable_sleep_) {
+    asm_.bind(sleep_error_label);
+      // Enter sleep mode (amx->error = AMX_ERR_SLEEP).
+      //
+      // amx->cip = (cell)((unsigned char *)cip-code);
+      // amx->hea = hea;
+      // amx->frm = frm;
+      // amx->stk = stk;
+      // amx->pri = pri;
+      // amx->alt = alt;
+      // amx->reset_stk = reset_stk;
+      // amx->reset_hea = reset_hea;
+      EmitDebugPrint("AMX_ERR_SLEEP");
+
+      asm_.mov(edx, dword_ptr(amx_ptr_label_));
+      asm_.mov(dword_ptr(edx, offsetof(AMX, pri)), eax);
+      asm_.mov(dword_ptr(edx, offsetof(AMX, alt)), ecx);
+      asm_.mov(ecx, dword_ptr(reset_stk_label_));
+      asm_.mov(dword_ptr(edx, offsetof(AMX, reset_stk)), ecx);
+      asm_.mov(ecx, dword_ptr(reset_hea_label_));
+      asm_.mov(dword_ptr(edx, offsetof(AMX, reset_hea)), ecx);
+
+      asm_.jmp(exec_exit_label_);
+    }
+}
+
+void CompilerImpl::EmitDebugPrint(const char *message) {
+  if (debug_flags_ & DEBUG_LOGGING) {
+    asm_.push(eax);
+    asm_.push(edx);
+    asm_.push(ecx);
+    asm_.push((intptr_t)message);
+    asm_.call((intptr_t)puts);
+    asm_.add(esp, 4);
+    asm_.pop(ecx);
+    asm_.pop(edx);
+    asm_.pop(eax);
+  }
+}
+
+void CompilerImpl::EmitDebugBreakpoint() {
+  if ((debug_flags_ & DEBUG_BREAKPOINTS) && IsDebuggerPresent()) {
+    asm_.int3();
+  }
 }
 
 const Label &CompilerImpl::GetLabel(cell address) {

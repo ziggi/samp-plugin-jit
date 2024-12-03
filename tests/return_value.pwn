@@ -1,13 +1,12 @@
+// OUTPUT: All tests passed
+
 #include "test"
 
 public f();
 
 main() {
-	TestExit();
-}
-
-stock Test() {
 	TEST_TRUE(CallLocalFunction("f", "") == 133);
+	TestExit();
 }
 
 public f() {

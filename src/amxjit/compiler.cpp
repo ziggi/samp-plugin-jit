@@ -1,4 +1,4 @@
-// Copyright (c) 2012-2018 Zeex
+// Copyright (c) 2012-2019 Zeex
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -43,6 +43,18 @@ void Compiler::SetLogger(Logger *logger) {
 
 void Compiler::SetErrorHandler(CompileErrorHandler *error_handler) {
   impl_->SetErrorHandler(error_handler);
+}
+
+void Compiler::SetSysreqDEnabled(bool flag) {
+  impl_->SetSysreqDEnabled(flag);
+}
+
+void Compiler::SetSleepEnabled(bool flag) {
+  impl_->SetSleepEnabled(flag);
+}
+
+void Compiler::SetDebugFlags(unsigned int flags) {
+  impl_->SetDebugFlags(flags);
 }
 
 CodeBuffer *Compiler::Compile(AMXRef amx) {

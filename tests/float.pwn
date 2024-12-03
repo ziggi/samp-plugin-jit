@@ -1,4 +1,5 @@
-#include <a_samp>
+// OUTPUT: All tests passed
+
 #include "test"
 
 main() {

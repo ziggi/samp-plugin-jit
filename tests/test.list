@@ -27,6 +27,8 @@ jrel
 lctrl8
 minmax
 native_call
+native_error
+native_return_value
 nested_exec
 numargs
 onjitcompile
@@ -34,6 +36,8 @@ onjitcompile_return_0
 onjiterror
 presence
 return_value
+sleep_halt
+sleep_sysreq
 swapchars
 switch
 sysreq_preserve_alt

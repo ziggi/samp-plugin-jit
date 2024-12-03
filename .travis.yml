@@ -3,34 +3,33 @@ compiler: gcc
 
 env:
   global:
-    - SAMP_SERVER_ROOT=$TRAVIS_BUILD_DIR/samp03
+    - PATH=$PATH:$TRAVIS_BUILD_DIR:$TRAVIS_BUILD_DIR/plugin-runner-1.3-linux
+    - secure: "WRffGxdEZPHxs3pVmJHMKR7FY4IV1PqieTJhCkZJtGci89TDyRXTW8aj4/2SZ67Yq3qwjvhpfg0FwjMmRqg+tfhQ5f7r7h6H51zDuCHje3RIlUca8H+raliWbQGBuUVyt1uQiO1ufZ2epgcMiVorhUb8INjoq5BCXOfV7eRU39k="
 
 install:
-  - sudo apt-add-repository -y ppa:kubuntu-ppa/backports
   - sudo apt-get update -qq
-  - sudo apt-get install -y gcc-4.4 gcc-4.4-multilib g++-4.4 g++-4.4-multilib cmake python python-pip
+  - sudo apt-get install -y linux-libc-dev:i386 gcc-4.7 gcc-4.7-multilib g++-4.7 g++-4.7-multilib cmake
 
   - wget https://github.com/Zeex/pawn/releases/download/20150412/pawnc-3.10.20150412-linux.tar.gz
   - sudo tar xvf pawnc-3.10.20150412-linux.tar.gz --strip-components=1 -C /usr/local
   - sudo ldconfig
 
-  - wget https://www.dropbox.com/s/c6pu3qolxqeb480/samp03zsvr_R4.tar.gz
-  - tar xvf samp03zsvr_R4.tar.gz
+  - wget https://github.com/Zeex/samp-plugin-runner/releases/download/v1.3/plugin-runner-1.3-linux.tar.gz
+  - tar xvf plugin-runner-1.3-linux.tar.gz
 
-  - wget https://www.dropbox.com/s/9b5wca29x8uc9yi/samp03z_svr_R4_win32.zip
-  - unzip samp03z_svr_R4_win32.zip -d $SAMP_SERVER_ROOT pawno/include/*
-
-  - sudo pip install samp-server-cli
+  - wget https://www.dropbox.com/s/iuzb74xugjgdzkg/artifact-uploader-linux.tar.gz?dl=1 -O artifact-uploader-linux.tar.gz
+  - tar xvf artifact-uploader-linux.tar.gz
 
 before_script:
-  - cmake . -DCMAKE_BUILD_TYPE=Release
-            -DCMAKE_COMPILER=gcc-4.4
-            -DCMAKE_CXX_COMPILER=g++-4.4
+  - cmake . -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc-4.7 -DCMAKE_CXX_COMPILER=g++-4.7
 
 script:
   - make
   - make test
   - make package
+
+after_script:
+  - artifact-uploader $DROPBOX_TOKEN ./jit-*-linux.tar.gz
 
 after_failure:
   - cat Testing/Temporary/LastTest.log

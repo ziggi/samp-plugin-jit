@@ -1,4 +1,4 @@
-// Copyright (c) 2012-2015 Zeex
+// Copyright (c) 2012-2019 Zeex
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -65,8 +65,9 @@ T *AMXHandler<T>::GetHandler(AMX *amx) {
   typename HandlerMap::const_iterator iterator = handlers_.find(amx);
   if (iterator != handlers_.end()) {
     return iterator->second;
+  } else {
+    return CreateHandler(amx);
   }
-  return 0;
 }
 
 // static
